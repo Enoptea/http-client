@@ -12,6 +12,7 @@
 namespace Symfony\Component\HttpClient\Tests;
 
 use Symfony\Component\HttpClient\Exception\ClientException;
+use Symfony\Component\HttpClient\Exception\TransportException;
 use Symfony\Component\HttpClient\Response\StreamWrapper;
 use Symfony\Component\Process\Exception\ProcessFailedException;
 use Symfony\Component\Process\Process;
@@ -83,9 +84,9 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertSame($response, stream_get_meta_data($stream)['wrapper_data']->getResponse());
         $this->assertSame(404, $response->getStatusCode());
 
-        $this->expectException(ClientException::class);
         $response = $client->request('GET', 'http://localhost:8057/404');
-        $stream = $response->toStream();
+        $this->expectException(ClientException::class);
+        $response->toStream();
     }
 
     public function testNonBlockingStream()
@@ -93,6 +94,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $client = $this->getHttpClient(__FUNCTION__);
         $response = $client->request('GET', 'http://localhost:8057/timeout-body');
         $stream = $response->toStream();
+        usleep(10000);
 
         $this->assertTrue(stream_set_blocking($stream, false));
         $this->assertSame('<1>', fread($stream, 8192));
@@ -175,6 +177,55 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertSame($expected, $logger->logs);
     }
 
+    public function testPause()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/');
+
+        $time = microtime(true);
+        $response->getInfo('pause_handler')(0.5);
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertTrue(0.5 <= microtime(true) - $time);
+
+        $response = $client->request('GET', 'http://localhost:8057/');
+
+        $time = microtime(true);
+        $response->getInfo('pause_handler')(1);
+
+        foreach ($client->stream($response, 0.5) as $chunk) {
+            $this->assertTrue($chunk->isTimeout());
+            $response->cancel();
+        }
+        $response = null;
+        $this->assertTrue(1.0 > microtime(true) - $time);
+        $this->assertTrue(0.5 <= microtime(true) - $time);
+    }
+
+    public function testPauseReplace()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/');
+
+        $time = microtime(true);
+        $response->getInfo('pause_handler')(10);
+        $response->getInfo('pause_handler')(0.5);
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertGreaterThanOrEqual(0.5, microtime(true) - $time);
+        $this->assertLessThanOrEqual(5, microtime(true) - $time);
+    }
+
+    public function testPauseDuringBody()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/timeout-body');
+
+        $time = microtime(true);
+        $this->assertSame(200, $response->getStatusCode());
+        $response->getInfo('pause_handler')(1);
+        $response->getContent();
+        $this->assertGreaterThanOrEqual(1, microtime(true) - $time);
+    }
+
     public function testHttp2PushVulcainWithUnusedResponse()
     {
         $client = $this->getHttpClient(__FUNCTION__);
@@ -213,6 +264,15 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertSame($expected, $logger->logs);
     }
 
+    public function testDnsFailure()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://bad.host.test/');
+
+        $this->expectException(TransportException::class);
+        $response->getStatusCode();
+    }
+
     private static function startVulcain(HttpClientInterface $client)
     {
         if (self::$vulcainStarted) {
@@ -240,7 +300,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         sleep('\\' === \DIRECTORY_SEPARATOR ? 10 : 1);
 
         if (!$process->isRunning()) {
-            throw new ProcessFailedException($process);
+            self::markTestSkipped((new ProcessFailedException($process))->getMessage());
         }
 
         self::$vulcainStarted = true;

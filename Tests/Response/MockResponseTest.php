@@ -7,7 +7,7 @@ use Symfony\Component\HttpClient\Exception\JsonException;
 use Symfony\Component\HttpClient\Response\MockResponse;
 
 /**
- * Test methods from Symfony\Component\HttpClient\Response\ResponseTrait.
+ * Test methods from Symfony\Component\HttpClient\Response\*ResponseTrait.
  */
 class MockResponseTest extends TestCase
 {
@@ -33,8 +33,27 @@ class MockResponseTest extends TestCase
         $response->toArray();
     }
 
+    public function testUrlHttpMethodMockResponse(): void
+    {
+        $responseMock = new MockResponse(json_encode(['foo' => 'bar']));
+        $url = 'https://example.com/some-endpoint';
+        $response = MockResponse::fromRequest('GET', $url, [], $responseMock);
+
+        $this->assertSame('GET', $response->getInfo('http_method'));
+        $this->assertSame('GET', $responseMock->getRequestMethod());
+
+        $this->assertSame($url, $response->getInfo('url'));
+        $this->assertSame($url, $responseMock->getRequestUrl());
+    }
+
     public function toArrayErrors()
     {
+        yield [
+            'content' => '',
+            'responseHeaders' => [],
+            'message' => 'Response body is empty.',
+        ];
+
         yield [
             'content' => '{}',
             'responseHeaders' => ['content-type' => 'plain/text'],

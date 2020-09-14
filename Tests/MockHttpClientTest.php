@@ -100,6 +100,28 @@ class MockHttpClientTest extends HttpClientTestCase
     }
 
     /**
+     * @dataProvider validResponseFactoryProvider
+     */
+    public function testValidResponseFactory($responseFactory)
+    {
+        (new MockHttpClient($responseFactory))->request('GET', 'https://foo.bar');
+
+        $this->addToAssertionCount(1);
+    }
+
+    public function validResponseFactoryProvider()
+    {
+        return [
+            [static function (): MockResponse { return new MockResponse(); }],
+            [new MockResponse()],
+            [[new MockResponse()]],
+            [new \ArrayIterator([new MockResponse()])],
+            [null],
+            [(static function (): \Generator { yield new MockResponse(); })()],
+        ];
+    }
+
+    /**
      * @dataProvider transportExceptionProvider
      */
     public function testTransportExceptionThrowsIfPerformedMoreRequestsThanConfigured($factory)
@@ -140,6 +162,26 @@ class MockHttpClientTest extends HttpClientTestCase
                     new MockResponse(),
                 ]
             ),
+        ];
+    }
+
+    /**
+     * @dataProvider invalidResponseFactoryProvider
+     */
+    public function testInvalidResponseFactory($responseFactory, string $expectedExceptionMessage)
+    {
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage($expectedExceptionMessage);
+
+        (new MockHttpClient($responseFactory))->request('GET', 'https://foo.bar');
+    }
+
+    public function invalidResponseFactoryProvider()
+    {
+        return [
+            [static function (): \Generator { yield new MockResponse(); }, 'The response factory passed to MockHttpClient must return/yield an instance of ResponseInterface, "Generator" given.'],
+            [static function (): array { return [new MockResponse()]; }, 'The response factory passed to MockHttpClient must return/yield an instance of ResponseInterface, "array" given.'],
+            [(static function (): \Generator { yield 'ccc'; })(), 'The response factory passed to MockHttpClient must return/yield an instance of ResponseInterface, "string" given.'],
         ];
     }
 
@@ -190,8 +232,22 @@ class MockHttpClientTest extends HttpClientTestCase
                 $this->markTestSkipped("MockHttpClient doesn't unzip");
                 break;
 
+            case 'testTimeoutWithActiveConcurrentStream':
+                $this->markTestSkipped('Real transport required');
+                break;
+
             case 'testDestruct':
                 $this->markTestSkipped("MockHttpClient doesn't timeout on destruct");
+                break;
+
+            case 'testPause':
+            case 'testPauseReplace':
+            case 'testPauseDuringBody':
+                $this->markTestSkipped("MockHttpClient doesn't support pauses by default");
+                break;
+
+            case 'testDnsFailure':
+                $this->markTestSkipped("MockHttpClient doesn't use a DNS");
                 break;
 
             case 'testGetRequest':
@@ -253,6 +309,7 @@ class MockHttpClientTest extends HttpClientTestCase
 
             case 'testTimeoutOnStream':
             case 'testUncheckedTimeoutThrows':
+            case 'testTimeoutIsNotAFatalError':
                 $body = ['<1>', '', '<2>'];
                 $responses[] = new MockResponse($body, ['response_headers' => $headers]);
                 break;

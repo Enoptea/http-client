@@ -11,11 +11,11 @@
 
 namespace Symfony\Component\HttpClient\Exception;
 
-use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\DecodingExceptionInterface;
 
 /**
  * @author Nicolas Grekas <p@tchwork.com>
  */
-class TransportException extends \RuntimeException implements TransportExceptionInterface
+final class EventSourceException extends \RuntimeException implements DecodingExceptionInterface
 {
 }

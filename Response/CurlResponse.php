@@ -15,6 +15,7 @@ use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpClient\Chunk\FirstChunk;
 use Symfony\Component\HttpClient\Chunk\InformationalChunk;
 use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\ClientState;
 use Symfony\Component\HttpClient\Internal\CurlClientState;
 use Symfony\Contracts\HttpClient\Exception\HttpExceptionInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
@@ -24,24 +25,27 @@ use Symfony\Contracts\HttpClient\ResponseInterface;
  *
  * @internal
  */
-final class CurlResponse implements ResponseInterface
+final class CurlResponse implements ResponseInterface, StreamableInterface
 {
-    use ResponseTrait {
+    use CommonResponseTrait {
         getContent as private doGetContent;
     }
+    use TransportResponseTrait;
 
     private static $performing = false;
     private $multi;
     private $debugBuffer;
 
     /**
+     * @param \CurlHandle|resource|string $ch
+     *
      * @internal
      */
     public function __construct(CurlClientState $multi, $ch, array $options = null, LoggerInterface $logger = null, string $method = 'GET', callable $resolveRedirect = null, int $curlVersion = null)
     {
         $this->multi = $multi;
 
-        if (\is_resource($ch)) {
+        if (\is_resource($ch) || $ch instanceof \CurlHandle) {
             $this->handle = $ch;
             $this->debugBuffer = fopen('php://temp', 'w+');
             if (0x074000 === $curlVersion) {
@@ -72,7 +76,17 @@ final class CurlResponse implements ResponseInterface
         }
 
         curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($ch, string $data) use (&$info, &$headers, $options, $multi, $id, &$location, $resolveRedirect, $logger): int {
-            return self::parseHeaderLine($ch, $data, $info, $headers, $options, $multi, $id, $location, $resolveRedirect, $logger);
+            if (0 !== substr_compare($data, "\r\n", -2)) {
+                return 0;
+            }
+
+            $len = 0;
+
+            foreach (explode("\r\n", substr($data, 0, -2)) as $data) {
+                $len += 2 + self::parseHeaderLine($ch, $data, $info, $headers, $options, $multi, $id, $location, $resolveRedirect, $logger);
+            }
+
+            return $len;
         });
 
         if (null === $options) {
@@ -86,6 +100,27 @@ final class CurlResponse implements ResponseInterface
 
             return;
         }
+
+        $execCounter = $multi->execCounter;
+        $this->info['pause_handler'] = static function (float $duration) use ($ch, $multi, $execCounter) {
+            if (0 < $duration) {
+                if ($execCounter === $multi->execCounter) {
+                    $multi->execCounter = !\is_float($execCounter) ? 1 + $execCounter : PHP_INT_MIN;
+                    curl_multi_remove_handle($multi->handle, $ch);
+                }
+
+                $lastExpiry = end($multi->pauseExpiries);
+                $multi->pauseExpiries[(int) $ch] = $duration += microtime(true);
+                if (false !== $lastExpiry && $lastExpiry > $duration) {
+                    asort($multi->pauseExpiries);
+                }
+                curl_pause($ch, CURLPAUSE_ALL);
+            } else {
+                unset($multi->pauseExpiries[(int) $ch]);
+                curl_pause($ch, CURLPAUSE_CONT);
+                curl_multi_add_handle($multi->handle, $ch);
+            }
+        };
 
         $this->inflate = !isset($options['normalized_headers']['accept-encoding']);
         curl_pause($ch, CURLPAUSE_CONT);
@@ -204,7 +239,7 @@ final class CurlResponse implements ResponseInterface
     private function close(): void
     {
         $this->inflate = null;
-        unset($this->multi->openHandles[$this->id], $this->multi->handlesActivity[$this->id]);
+        unset($this->multi->pauseExpiries[$this->id], $this->multi->openHandles[$this->id], $this->multi->handlesActivity[$this->id]);
         curl_setopt($this->handle, CURLOPT_PRIVATE, '_0');
 
         if (self::$performing) {
@@ -242,8 +277,10 @@ final class CurlResponse implements ResponseInterface
 
     /**
      * {@inheritdoc}
+     *
+     * @param CurlClientState $multi
      */
-    private static function perform(CurlClientState $multi, array &$responses = null): void
+    private static function perform(ClientState $multi, array &$responses = null): void
     {
         if (self::$performing) {
             if ($responses) {
@@ -257,6 +294,7 @@ final class CurlResponse implements ResponseInterface
 
         try {
             self::$performing = true;
+            ++$multi->execCounter;
             $active = 0;
             while (CURLM_CALL_MULTI_PERFORM === curl_multi_exec($multi->handle, $active));
 
@@ -289,15 +327,40 @@ final class CurlResponse implements ResponseInterface
 
     /**
      * {@inheritdoc}
+     *
+     * @param CurlClientState $multi
      */
-    private static function select(CurlClientState $multi, float $timeout): int
+    private static function select(ClientState $multi, float $timeout): int
     {
         if (\PHP_VERSION_ID < 70123 || (70200 <= \PHP_VERSION_ID && \PHP_VERSION_ID < 70211)) {
             // workaround https://bugs.php.net/76480
             $timeout = min($timeout, 0.01);
         }
 
-        return curl_multi_select($multi->handle, $timeout);
+        if ($multi->pauseExpiries) {
+            $now = microtime(true);
+
+            foreach ($multi->pauseExpiries as $id => $pauseExpiry) {
+                if ($now < $pauseExpiry) {
+                    $timeout = min($timeout, $pauseExpiry - $now);
+                    break;
+                }
+
+                unset($multi->pauseExpiries[$id]);
+                curl_pause($multi->openHandles[$id][0], CURLPAUSE_CONT);
+                curl_multi_add_handle($multi->handle, $multi->openHandles[$id][0]);
+            }
+        }
+
+        if (0 !== $selected = curl_multi_select($multi->handle, $timeout)) {
+            return $selected;
+        }
+
+        if ($multi->pauseExpiries && 0 < $timeout -= microtime(true) - $now) {
+            usleep(1E6 * $timeout);
+        }
+
+        return 0;
     }
 
     /**
@@ -311,13 +374,20 @@ final class CurlResponse implements ResponseInterface
             return \strlen($data); // Ignore HTTP trailers
         }
 
-        if ("\r\n" !== $data) {
-            // Regular header line: add it to the list
-            self::addResponseHeaders([substr($data, 0, -2)], $info, $headers);
+        if ('' !== $data) {
+            try {
+                // Regular header line: add it to the list
+                self::addResponseHeaders([$data], $info, $headers);
+            } catch (TransportException $e) {
+                $multi->handlesActivity[$id][] = null;
+                $multi->handlesActivity[$id][] = $e;
+
+                return \strlen($data);
+            }
 
             if (0 !== strpos($data, 'HTTP/')) {
                 if (0 === stripos($data, 'Location:')) {
-                    $location = trim(substr($data, 9, -2));
+                    $location = trim(substr($data, 9));
                 }
 
                 return \strlen($data);
