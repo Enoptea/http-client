@@ -60,6 +60,10 @@ final class EventSourceHttpClient implements HttpClientInterface
 
         if ($accept = self::normalizeHeaders($options['headers'] ?? [])['accept'] ?? []) {
             $state->buffer = \in_array($accept, [['Accept: text/event-stream'], ['accept: text/event-stream']], true) ? '' : null;
+
+            if (null !== $state->buffer) {
+                $options['extra']['trace_content'] = false;
+            }
         }
 
         return new AsyncResponse($this->client, $method, $url, $options, static function (ChunkInterface $chunk, AsyncContext $context) use ($state, $method, $url, $options) {
@@ -121,7 +125,7 @@ final class EventSourceHttpClient implements HttpClientInterface
             if ($chunk->isLast()) {
                 $rx = substr_replace($rx, '|$', -2, 0);
             }
-            $events = preg_split($rx, $content, -1, PREG_SPLIT_DELIM_CAPTURE);
+            $events = preg_split($rx, $content, -1, \PREG_SPLIT_DELIM_CAPTURE);
             $state->buffer = array_pop($events);
 
             for ($i = 0; isset($events[$i]); $i += 2) {

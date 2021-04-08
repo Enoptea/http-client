@@ -13,9 +13,11 @@ namespace Symfony\Component\HttpClient\Tests;
 
 use Symfony\Component\HttpClient\Exception\ClientException;
 use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\ClientState;
 use Symfony\Component\HttpClient\Response\StreamWrapper;
 use Symfony\Component\Process\Exception\ProcessFailedException;
 use Symfony\Component\Process\Process;
+use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\Test\HttpClientTestCase as BaseHttpClientTestCase;
 
@@ -71,6 +73,19 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertIsArray(json_decode(fread($stream, 1024), true));
         $this->assertSame('', fread($stream, 1));
         $this->assertTrue(feof($stream));
+    }
+
+    public function testStreamCopyToStream()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057');
+        $h = fopen('php://temp', 'w+');
+        stream_copy_to_stream($response->toStream(), $h);
+
+        $this->assertTrue(rewind($h));
+        $this->assertSame("{\n    \"SER", fread($h, 10));
+        $this->assertSame('VER_PROTOCOL', fread($h, 12));
+        $this->assertFalse(feof($h));
     }
 
     public function testToStream404()
@@ -300,9 +315,40 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         sleep('\\' === \DIRECTORY_SEPARATOR ? 10 : 1);
 
         if (!$process->isRunning()) {
+            if ('\\' !== \DIRECTORY_SEPARATOR && 127 === $process->getExitCode()) {
+                self::markTestSkipped('vulcain binary is missing');
+            }
+
+            if ('\\' !== \DIRECTORY_SEPARATOR && 126 === $process->getExitCode()) {
+                self::markTestSkipped('vulcain binary is not executable');
+            }
+
             self::markTestSkipped((new ProcessFailedException($process))->getMessage());
         }
 
         self::$vulcainStarted = true;
+    }
+
+    public function testHandleIsRemovedOnException()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        try {
+            $client->request('GET', 'http://localhost:8057/304');
+            $this->fail(RedirectionExceptionInterface::class.' expected');
+        } catch (RedirectionExceptionInterface $e) {
+            // The response content-type mustn't be json as that calls getContent
+            // @see src/Symfony/Component/HttpClient/Exception/HttpExceptionTrait.php:58
+            $this->assertStringNotContainsString('json', $e->getResponse()->getHeaders(false)['content-type'][0] ?? '');
+            unset($e);
+
+            $r = new \ReflectionProperty($client, 'multi');
+            $r->setAccessible(true);
+            /** @var ClientState $clientState */
+            $clientState = $r->getValue($client);
+
+            $this->assertCount(0, $clientState->handlesActivity);
+            $this->assertCount(0, $clientState->openHandles);
+        }
     }
 }

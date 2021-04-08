@@ -29,6 +29,7 @@ use Symfony\Component\HttpClient\Exception\TransportException;
 use Symfony\Component\HttpClient\HttpClientTrait;
 use Symfony\Component\HttpClient\Internal\AmpBody;
 use Symfony\Component\HttpClient\Internal\AmpClientState;
+use Symfony\Component\HttpClient\Internal\Canary;
 use Symfony\Component\HttpClient\Internal\ClientState;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 
@@ -126,6 +127,11 @@ final class AmpResponse implements ResponseInterface, StreamableInterface
 
         $multi->openHandles[$id] = $id;
         ++$multi->responseCount;
+
+        $this->canary = new Canary(static function () use ($canceller, $multi, $id) {
+            $canceller->cancel();
+            unset($multi->openHandles[$id], $multi->handlesActivity[$id]);
+        });
     }
 
     /**
@@ -136,28 +142,27 @@ final class AmpResponse implements ResponseInterface, StreamableInterface
         return null !== $type ? $this->info[$type] ?? null : $this->info;
     }
 
+    public function __sleep()
+    {
+        throw new \BadMethodCallException('Cannot serialize '.__CLASS__);
+    }
+
+    public function __wakeup()
+    {
+        throw new \BadMethodCallException('Cannot unserialize '.__CLASS__);
+    }
+
     public function __destruct()
     {
         try {
             $this->doDestruct();
         } finally {
-            $this->close();
-
             // Clear the DNS cache when all requests completed
             if (0 >= --$this->multi->responseCount) {
                 $this->multi->responseCount = 0;
                 $this->multi->dnsCache = [];
             }
         }
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    private function close(): void
-    {
-        $this->canceller->cancel();
-        unset($this->multi->openHandles[$this->id], $this->multi->handlesActivity[$this->id]);
     }
 
     /**
@@ -222,11 +227,9 @@ final class AmpResponse implements ResponseInterface, StreamableInterface
 
     private static function generateResponse(Request $request, AmpClientState $multi, string $id, array &$info, array &$headers, CancellationTokenSource $canceller, array &$options, \Closure $onProgress, &$handle, ?LoggerInterface $logger, Promise &$pause)
     {
-        $activity = &$multi->handlesActivity;
-
-        $request->setInformationalResponseHandler(static function (Response $response) use (&$activity, $id, &$info, &$headers) {
+        $request->setInformationalResponseHandler(static function (Response $response) use ($multi, $id, &$info, &$headers) {
             self::addResponseHeaders($response, $info, $headers);
-            $activity[$id][] = new InformationalChunk($response->getStatus(), $response->getHeaders());
+            $multi->handlesActivity[$id][] = new InformationalChunk($response->getStatus(), $response->getHeaders());
             self::stopLoop();
         });
 
@@ -240,11 +243,11 @@ final class AmpResponse implements ResponseInterface, StreamableInterface
 
             $options = null;
 
-            $activity[$id][] = new FirstChunk();
+            $multi->handlesActivity[$id][] = new FirstChunk();
 
             if ('HEAD' === $response->getRequest()->getMethod() || \in_array($info['http_code'], [204, 304], true)) {
-                $activity[$id][] = null;
-                $activity[$id][] = null;
+                $multi->handlesActivity[$id][] = null;
+                $multi->handlesActivity[$id][] = null;
                 self::stopLoop();
 
                 return;
@@ -266,14 +269,14 @@ final class AmpResponse implements ResponseInterface, StreamableInterface
                 }
 
                 $info['size_download'] += \strlen($data);
-                $activity[$id][] = $data;
+                $multi->handlesActivity[$id][] = $data;
             }
 
-            $activity[$id][] = null;
-            $activity[$id][] = null;
+            $multi->handlesActivity[$id][] = null;
+            $multi->handlesActivity[$id][] = null;
         } catch (\Throwable $e) {
-            $activity[$id][] = null;
-            $activity[$id][] = $e;
+            $multi->handlesActivity[$id][] = null;
+            $multi->handlesActivity[$id][] = $e;
         } finally {
             $info['download_content_length'] = $info['size_download'];
         }

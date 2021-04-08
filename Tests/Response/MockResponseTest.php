@@ -11,6 +11,24 @@ use Symfony\Component\HttpClient\Response\MockResponse;
  */
 class MockResponseTest extends TestCase
 {
+    public function testTotalTimeShouldBeSimulatedWhenNotProvided()
+    {
+        $response = new MockResponse('body');
+        $response = MockResponse::fromRequest('GET', 'https://example.com/file.txt', [], $response);
+
+        $this->assertNotNull($response->getInfo('total_time'));
+        $this->assertGreaterThan(0.0, $response->getInfo('total_time'));
+    }
+
+    public function testTotalTimeShouldNotBeSimulatedWhenProvided()
+    {
+        $totalTime = 4.2;
+        $response = new MockResponse('body', ['total_time' => $totalTime]);
+        $response = MockResponse::fromRequest('GET', 'https://example.com/file.txt', [], $response);
+
+        $this->assertEquals($totalTime, $response->getInfo('total_time'));
+    }
+
     public function testToArray()
     {
         $data = ['color' => 'orange', 'size' => 42];
@@ -33,7 +51,7 @@ class MockResponseTest extends TestCase
         $response->toArray();
     }
 
-    public function testUrlHttpMethodMockResponse(): void
+    public function testUrlHttpMethodMockResponse()
     {
         $responseMock = new MockResponse(json_encode(['foo' => 'bar']));
         $url = 'https://example.com/some-endpoint';
@@ -52,12 +70,6 @@ class MockResponseTest extends TestCase
             'content' => '',
             'responseHeaders' => [],
             'message' => 'Response body is empty.',
-        ];
-
-        yield [
-            'content' => '{}',
-            'responseHeaders' => ['content-type' => 'plain/text'],
-            'message' => 'Response content-type is "plain/text" while a JSON-compatible one was expected for "https://example.com/file.json".',
         ];
 
         yield [
